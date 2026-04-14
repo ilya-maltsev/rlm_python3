@@ -1,0 +1,22 @@
+services:
+  freeradius:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      RADIUS_PI_HOST: ${RADIUS_PI_HOST:-https://localhost}
+      RADIUS_PI_SSLCHECK: ${RADIUS_PI_SSLCHECK:-false}
+      RADIUS_PI_REALM: ${RADIUS_PI_REALM:-}
+      RADIUS_PI_RESCONF: ${RADIUS_PI_RESCONF:-}
+      RADIUS_PI_TIMEOUT: ${RADIUS_PI_TIMEOUT:-10}
+      RADIUS_DEBUG: ${RADIUS_DEBUG:-false}
+    ports:
+      - "${RADIUS_PORT:-1812}:1812/tcp"
+      - "${RADIUS_PORT:-1812}:1812/udp"
+      - "${RADIUS_PORT_INC:-1813}:1813/udp"
+    volumes:
+      - type: bind
+        source: ./templates/clients.conf
+        target: /etc/raddb/clients.conf
+        read_only: true
+    restart: unless-stopped

@@ -1,0 +1,29 @@
+python python-privacyidea {
+    python_path = /usr/share/privacyidea/freeradius
+    module = privacyidea_radius
+
+    mod_instantiate = ${.module}
+    func_instantiate = instantiate
+
+    mod_authenticate = ${.module}
+    func_authenticate = authenticate
+
+    mod_authorize = ${.module}
+    func_authorize = authorize
+
+    mod_preacct = ${.module}
+    func_preacct = preacct
+
+    mod_accounting = ${.module}
+    func_accounting = accounting
+
+    mod_post_auth = ${.module}
+    func_post_auth = post_auth
+
+    mod_detach = ${.module}
+    func_detach = detach
+
+    config {
+        configfile = /etc/raddb/rlm_python.ini
+    }
+}
