@@ -8,6 +8,8 @@
 #    License: GPLv2
 #
 
+from __future__ import annotations
+
 import configparser
 import binascii
 import logging

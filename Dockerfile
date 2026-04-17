@@ -8,14 +8,12 @@ COPY entrypoint.sh /
 COPY privacyidea_radius.py /usr/share/privacyidea/freeradius/
 COPY dictionary.netknights /etc/raddb/dictionary
 
-# Install Python dependencies and FreeRADIUS python module
+# Install Python runtime and dependencies
+# rlm_python3.so is already included in the base freeradius image
 RUN apk update && apk add --no-cache \
         python3 \
-        py3-pip \
         py3-requests \
-        py3-chardet \
-        freeradius-python \
-        freeradius-utils
+        py3-chardet
 
 RUN rm -f /etc/raddb/sites-enabled/inner-tunnel \
           /etc/raddb/sites-enabled/default \
