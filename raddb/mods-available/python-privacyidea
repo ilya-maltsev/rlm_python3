@@ -1,4 +1,4 @@
-python python-privacyidea {
+python3 python-privacyidea {
     python_path = /usr/share/privacyidea/freeradius
     module = privacyidea_radius
 
