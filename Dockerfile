@@ -14,7 +14,7 @@ RUN apk update && apk add --no-cache \
         py3-pip \
         py3-requests \
         py3-chardet \
-        freeradius-python \
+        freeradius-python3 \
         freeradius-utils
 
 RUN rm -f /etc/raddb/sites-enabled/inner-tunnel \
