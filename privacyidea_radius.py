@@ -16,6 +16,7 @@ import logging
 import logging.handlers
 import os
 import re
+import socket
 import time
 from typing import Any
 
@@ -108,13 +109,29 @@ _SYSLOG_FACILITY_MAP = {
     "local7":   logging.handlers.SysLogHandler.LOG_LOCAL7,
 }
 
+_SYSLOG_LEVEL_MAP = {
+    "DEBUG":    logging.DEBUG,
+    "INFO":     logging.INFO,
+    "WARNING":  logging.WARNING,
+    "ERROR":    logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
 _syslog: logging.Logger | None = None
 
 
 def _setup_syslog(tag: str = "privacyidea-radius",
                   facility: str = "auth",
-                  socket: str = "") -> None:
+                  local_socket: str = "",
+                  host: str = "",
+                  port: int = 514,
+                  proto: str = "udp",
+                  level: str = "INFO") -> None:
     """Initialize syslog logger.
+
+    If ``host`` is set, forward to a remote rsyslog server at ``host:port``
+    over ``proto`` (udp/tcp). Otherwise use a local socket (``local_socket``
+    override, else /dev/log, else /var/run/syslog, else localhost:514).
 
     Called once from instantiate() after config is loaded.
     """
@@ -123,22 +140,34 @@ def _setup_syslog(tag: str = "privacyidea-radius",
     fac = _SYSLOG_FACILITY_MAP.get(facility.lower(),
                                     logging.handlers.SysLogHandler.LOG_AUTH)
 
-    # Determine syslog socket path
-    if socket:
-        address = socket
+    socktype = None
+    if host:
+        address = (host, int(port))
+        socktype = (socket.SOCK_STREAM if proto.lower() == "tcp"
+                    else socket.SOCK_DGRAM)
+    elif local_socket:
+        address = local_socket
     elif os.path.exists("/dev/log"):
         address = "/dev/log"
     elif os.path.exists("/var/run/syslog"):
         address = "/var/run/syslog"  # macOS
     else:
         address = ("localhost", 514)
+        socktype = socket.SOCK_DGRAM
+
+    py_level = _SYSLOG_LEVEL_MAP.get(level.upper(), logging.INFO)
 
     _syslog = logging.getLogger(tag)
     _syslog.handlers.clear()
-    _syslog.setLevel(logging.DEBUG)
+    _syslog.setLevel(py_level)
 
     try:
-        handler = logging.handlers.SysLogHandler(address=address, facility=fac)
+        if socktype is not None:
+            handler = logging.handlers.SysLogHandler(
+                address=address, facility=fac, socktype=socktype)
+        else:
+            handler = logging.handlers.SysLogHandler(
+                address=address, facility=fac)
         formatter = logging.Formatter(f"{tag}: [%(levelname)s] %(message)s")
         handler.setFormatter(formatter)
         _syslog.addHandler(handler)
@@ -148,7 +177,7 @@ def _setup_syslog(tag: str = "privacyidea-radius",
         handler.setFormatter(logging.Formatter(
             f"{tag}: [%(levelname)s] %(message)s"))
         _syslog.addHandler(handler)
-        _syslog.warning(f"syslog socket unavailable ({e}), falling back to stderr")
+        _syslog.warning(f"syslog unavailable ({e}), falling back to stderr")
 
 
 def _log(level: int, msg: str) -> None:
@@ -168,6 +197,62 @@ def _log(level: int, msg: str) -> None:
     if _syslog:
         py_level = _LEVEL_TO_PYTHON.get(level, logging.INFO)
         _syslog.log(py_level, msg)
+
+
+# ---------------------------------------------------------------------------
+# Redaction for DEBUG packet dumps
+# ---------------------------------------------------------------------------
+# Values of any key whose lowercased name contains one of these substrings are
+# replaced with "***" before being emitted to logs. Keep conservative — this
+# runs at DEBUG and we must never log credentials / JWTs / CHAP material.
+_SECRET_SUBSTRINGS = (
+    "password", "pass",
+    "chap-challenge", "chap-response", "chap-password",
+    "mschap", "ms-chap",
+    "authorization", "cookie",
+    "token", "secret",
+)
+
+
+def _is_secret_key(name: str) -> bool:
+    n = str(name).lower()
+    return any(s in n for s in _SECRET_SUBSTRINGS)
+
+
+def _redact_value(key: str, value: Any) -> Any:
+    return "***" if _is_secret_key(key) else value
+
+
+def _redact_mapping(items) -> dict:
+    """Return a dict copy with sensitive values replaced by '***'."""
+    out = {}
+    try:
+        iterator = items.items() if hasattr(items, "items") else items
+    except Exception:
+        return {}
+    for k, v in iterator:
+        out[k] = "***" if _is_secret_key(k) else v
+    return out
+
+
+def _redact_json_body(text: str) -> str:
+    """Redact values of sensitive keys in a JSON body. Returns original string
+    on parse failure (likely not JSON)."""
+    import json
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return text
+
+    def walk(node):
+        if isinstance(node, dict):
+            return {k: ("***" if _is_secret_key(k) else walk(v))
+                    for k, v in node.items()}
+        if isinstance(node, list):
+            return [walk(x) for x in node]
+        return node
+
+    return json.dumps(walk(obj), separators=(",", ":"))
 
 # Service-Type values (RFC 2865 section 5.6, RFC 5765)
 SERVICE_TYPE_LOGIN = 1
@@ -212,7 +297,11 @@ DEFAULT_CONFIG = {
     "SYSLOG": "TRUE",                   # enable syslog output
     "SYSLOG_TAG": "privacyidea-radius", # syslog ident / program name
     "SYSLOG_FACILITY": "auth",          # syslog facility
-    "SYSLOG_SOCKET": "",                # syslog socket path (auto-detect)
+    "SYSLOG_SOCKET": "",                # local syslog socket path (auto-detect)
+    "SYSLOG_HOST": "",                  # remote rsyslog host (empty = local)
+    "SYSLOG_PORT": "514",               # remote rsyslog port
+    "SYSLOG_PROTO": "udp",              # remote transport: udp | tcp
+    "SYSLOG_LEVEL": "INFO",             # DEBUG | INFO | WARNING | ERROR | CRITICAL
 }
 
 CONFIG_SEARCH_PATHS = [
@@ -263,7 +352,7 @@ def _get_config_for_auth_type(auth_type: str) -> dict[str, str]:
     if not INI or not auth_type:
         return cfg
 
-    _log(L_INFO, f"Looking for config for auth-type {auth_type}")
+    _log(L_DBG, f"Looking for config for auth-type {auth_type}")
 
     for key in DEFAULT_CONFIG:
         val = INI.get(auth_type, key, fallback=None)
@@ -291,11 +380,11 @@ def _decode_bytes(raw: str) -> str:
         detected = chardet.detect(raw)
         if detected and detected.get("encoding"):
             try:
-                _log(L_INFO, f"Encoding detected: {detected['encoding']}")
+                _log(L_DBG, f"Encoding detected: {detected['encoding']}")
                 return raw.decode(detected["encoding"])
             except (UnicodeDecodeError, LookupError):
                 pass
-        _log(L_INFO, "Could not detect encoding. Using as-is.")
+        _log(L_DBG, "Could not detect encoding. Using as-is.")
     return raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
 
 
@@ -329,7 +418,7 @@ def _map_response(decoded: dict) -> dict[str, list[str]]:
             radius_attr = INI.get("Mapping", key)
             value = detail.get(key)
             if value is not None:
-                _log(L_INFO, f"+++ Map: {key} -> {radius_attr}")
+                _log(L_DBG, f"+++ Map: {key} -> {radius_attr}")
                 rad_reply.setdefault(radius_attr, []).append(str(value))
 
     # --- Process [Mapping *] sub-sections and [Attribute *] sections ---
@@ -346,17 +435,17 @@ def _map_response(decoded: dict) -> dict[str, list[str]]:
             sub = detail.get(member_name, {})
             if not isinstance(sub, dict):
                 continue
-            _log(L_INFO, f"++++ Parsing Mapping sub-section: {section}")
+            _log(L_DBG, f"++++ Parsing Mapping sub-section: {section}")
             for key in INI.options(section):
                 radius_attr = INI.get(section, key)
                 value = sub.get(key)
                 if value is not None:
-                    _log(L_INFO, f"++++++ Map: {member_name} : {key} -> {radius_attr}")
+                    _log(L_DBG, f"++++++ Map: {member_name} : {key} -> {radius_attr}")
                     rad_reply.setdefault(radius_attr, []).append(str(value))
 
         elif group == "Attribute":
             # [Attribute Filter-Id] / [Attribute otherAttribute]
-            _log(L_INFO, f"++++ Parsing Attribute section: {section}")
+            _log(L_DBG, f"++++ Parsing Attribute section: {section}")
 
             radius_attr = member_name
             ra_override = INI.get(section, "radiusAttribute", fallback=None)
@@ -372,17 +461,17 @@ def _map_response(decoded: dict) -> dict[str, list[str]]:
             if not user_attribute or not regex:
                 continue
 
-            _log(L_INFO,
-                           f"++++++ Attribute: IF '{directory}'->'{user_attribute}' "
-                           f"== '{regex}' THEN '{radius_attr}'")
+            _log(L_DBG,
+                 f"++++++ Attribute: IF '{directory}'->'{user_attribute}' "
+                 f"== '{regex}' THEN '{radius_attr}'")
 
             # Get attribute value from response
             if directory:
                 attr_value = detail.get(directory, {}).get(user_attribute)
-                _log(L_INFO, f"++++++ searching in directory {directory}")
+                _log(L_DBG, f"++++++ searching in directory {directory}")
             else:
                 attr_value = detail.get(user_attribute)
-                _log(L_INFO, "++++++ no directory")
+                _log(L_DBG, "++++++ no directory")
 
             # Normalize to list
             values: list
@@ -390,24 +479,24 @@ def _map_response(decoded: dict) -> dict[str, list[str]]:
                 values = []
             elif isinstance(attr_value, list):
                 values = attr_value
-                _log(L_INFO, f"+++++++ User attribute is a list")
+                _log(L_DBG, f"+++++++ User attribute is a list")
             else:
                 values = [attr_value]
-                _log(L_INFO, f"+++++++ User attribute is a string: {attr_value}")
+                _log(L_DBG, f"+++++++ User attribute is a string: {attr_value}")
 
             for val in values:
                 val_str = str(val)
-                _log(L_INFO, f"+++++++ trying to match {val_str}")
+                _log(L_DBG, f"+++++++ trying to match {val_str}")
                 m = re.search(regex, val_str)
                 if m:
                     result = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
                     final = f"{prefix}{result}{suffix}"
                     rad_reply.setdefault(radius_attr, []).append(final)
-                    _log(L_INFO,
-                                   f"++++++++ Result: Add RADIUS attribute {radius_attr} = {final}")
+                    _log(L_DBG,
+                         f"++++++++ Result: Add RADIUS attribute {radius_attr} = {final}")
                 else:
-                    _log(L_INFO,
-                                   f"++++++++ Result: No match, no RADIUS attribute {radius_attr} added.")
+                    _log(L_DBG,
+                         f"++++++++ Result: No match, no RADIUS attribute {radius_attr} added.")
 
     return rad_reply
 
@@ -424,25 +513,30 @@ def _call_privacyidea(url: str, params: dict, cfg: dict) -> requests.Response:
 
     verify: bool | str
     if ssl_check:
-        _log(L_INFO, "Verifying SSL certificate!")
+        _log(L_DBG, "Verifying SSL certificate!")
         if ssl_ca_path:
-            _log(L_INFO, f"SSL_CA_PATH: {ssl_ca_path}")
+            _log(L_DBG, f"SSL_CA_PATH: {ssl_ca_path}")
             verify = ssl_ca_path
         else:
-            _log(L_INFO, "Verifying SSL certificate against system wide CAs!")
+            _log(L_DBG, "Verifying SSL certificate against system wide CAs!")
             verify = True
     else:
-        _log(L_INFO, "Not verifying SSL certificate!")
+        _log(L_DBG, "Not verifying SSL certificate!")
         verify = False
 
     session = requests.Session()
     session.headers["User-Agent"] = "FreeRADIUS"
 
-    _log(L_INFO, f"Request timeout: {timeout}")
+    _log(L_DBG, f"Request timeout: {timeout}")
+    _log(L_DBG, f"PI HTTP >>> POST {url} headers={_redact_mapping(session.headers)} "
+                f"body={_redact_mapping(params)}")
     start = time.time()
     response = session.post(url, data=params, verify=verify, timeout=timeout)
     elapsed = time.time() - start
-    _log(L_INFO, f"elapsed time for privacyidea call: {elapsed:.6f}")
+    _log(L_DBG, f"PI call elapsed: {elapsed:.3f}s status={response.status_code}")
+    _log(L_DBG, f"PI HTTP <<< {response.status_code} {response.reason} "
+                f"headers={_redact_mapping(response.headers)} "
+                f"body={_redact_json_body(response.text)}")
 
     return response
 
@@ -464,13 +558,21 @@ def instantiate(p: tuple) -> int:
         _setup_syslog(
             tag=CONFIG.get("SYSLOG_TAG", "privacyidea-radius"),
             facility=CONFIG.get("SYSLOG_FACILITY", "auth"),
-            socket=CONFIG.get("SYSLOG_SOCKET", ""),
+            local_socket=CONFIG.get("SYSLOG_SOCKET", ""),
+            host=CONFIG.get("SYSLOG_HOST", ""),
+            port=int(CONFIG.get("SYSLOG_PORT", "514") or "514"),
+            proto=CONFIG.get("SYSLOG_PROTO", "udp"),
+            level=CONFIG.get("SYSLOG_LEVEL", "INFO"),
         )
 
     _log(L_INFO, f"rlm_python3 privacyIDEA instantiate, configfile={config_file}")
     _log(L_INFO, f"Config file {CONFIG_FILE}")
+    _remote = (f"{CONFIG.get('SYSLOG_HOST')}:{CONFIG.get('SYSLOG_PORT')}/"
+               f"{CONFIG.get('SYSLOG_PROTO')}"
+               if CONFIG.get("SYSLOG_HOST") else "local")
     _log(L_INFO, f"syslog enabled, tag={CONFIG.get('SYSLOG_TAG')}, "
-                 f"facility={CONFIG.get('SYSLOG_FACILITY')}")
+                 f"facility={CONFIG.get('SYSLOG_FACILITY')}, "
+                 f"level={CONFIG.get('SYSLOG_LEVEL')}, target={_remote}")
     return 0
 
 
@@ -530,15 +632,15 @@ def _build_params(rad_request: dict, cfg: dict) -> dict[str, str]:
     # Client IP: NAS-IP-Address -> Packet-Src-IP-Address -> CLIENTATTRIBUTE
     if "NAS-IP-Address" in rad_request:
         params["client"] = rad_request["NAS-IP-Address"]
-        _log(L_INFO, f"Setting client IP to {params['client']}.")
+        _log(L_DBG, f"Setting client IP to {params['client']} (from NAS-IP-Address)")
     elif "Packet-Src-IP-Address" in rad_request:
         params["client"] = rad_request["Packet-Src-IP-Address"]
-        _log(L_INFO, f"Setting client IP to {params['client']}.")
+        _log(L_DBG, f"Setting client IP to {params['client']} (from Packet-Src-IP-Address)")
 
     client_attr = cfg.get("CLIENTATTRIBUTE", "")
     if client_attr and client_attr in rad_request:
         params["client"] = rad_request[client_attr]
-        _log(L_INFO, f"Setting client IP to {params['client']}.")
+        _log(L_DBG, f"Setting client IP to {params['client']} (from {client_attr})")
 
     # Realm
     realm = cfg.get("REALM", "")
@@ -581,6 +683,9 @@ def _handle_authorize_only(rad_request: dict, cfg: dict) -> tuple:
 
     reply_pairs.append(("Reply-Message", "privacyIDEA authorize only — accepted"))
 
+    _log(L_DBG, f"RADIUS reply <<< code={RET_NAMES[RLM_MODULE_OK]} "
+                f"reply={_redact_mapping(reply_pairs)} "
+                f"config={_redact_mapping(config_pairs)}")
     _log(L_INFO, f"return {RET_NAMES[RLM_MODULE_OK]}")
     return (RLM_MODULE_OK, tuple(reply_pairs), tuple(config_pairs))
 
@@ -594,11 +699,11 @@ def _handle_pi_response(response: requests.Response, params: dict,
     g_return = RLM_MODULE_REJECT
 
     if debug:
-        _log(L_DBG, f"Content {content}")
+        _log(L_DBG, f"Content {_redact_json_body(content)}")
 
     if not response.ok:
         status_line = f"{response.status_code} {response.reason}"
-        _log(L_INFO, f"privacyIDEA request failed: {status_line}")
+        _log(L_ERR, f"privacyIDEA request failed: {status_line}")
         reply_pairs[reply_message_idx] = (
             "Reply-Message", f"privacyIDEA request failed: {status_line}")
         return RLM_MODULE_FAIL
@@ -608,13 +713,16 @@ def _handle_pi_response(response: requests.Response, params: dict,
     try:
         decoded = response.json()
         message = decoded.get("detail", {}).get("message", "")
+        serial = decoded.get("detail", {}).get("serial", "")
 
         if decoded.get("result", {}).get("value"):
             # Authentication successful
             user = params.get("user", "")
             realm_val = params.get("realm", "")
+            serial_suffix = f" serial={serial}" if serial else ""
             _log(L_INFO,
-                           f"privacyIDEA access granted for {user} realm='{realm_val}'")
+                 f"privacyIDEA access granted for {user} realm='{realm_val}'"
+                 f"{serial_suffix}")
             reply_pairs[reply_message_idx] = (
                 "Reply-Message", "privacyIDEA access granted")
 
@@ -623,19 +731,25 @@ def _handle_pi_response(response: requests.Response, params: dict,
                     for v in values:
                         reply_pairs.append((attr, v))
             else:
-                _log(L_INFO,
-                               "Service-Type=Authenticate-Only, strict mode — "
-                               "skipping attribute mapping")
+                _log(L_DBG,
+                     "Service-Type=Authenticate-Only, strict mode — "
+                     "skipping attribute mapping")
 
             g_return = RLM_MODULE_OK
 
         elif decoded.get("result", {}).get("status"):
-            _log(L_INFO, "privacyIDEA Result status is true!")
+            _log(L_DBG, "privacyIDEA Result status is true!")
             reply_pairs[reply_message_idx] = ("Reply-Message", message)
 
             transaction_id = decoded.get("detail", {}).get("transaction_id")
             if transaction_id:
                 # Challenge-response mode
+                user = params.get("user", "")
+                realm_val = params.get("realm", "")
+                _log(L_INFO,
+                     f"privacyIDEA challenge issued for {user} "
+                     f"realm='{realm_val}' tx={transaction_id} "
+                     f"message='{message}'")
                 reply_pairs.append(("State", transaction_id))
                 config_pairs.append(("Response-Packet-Type", "Access-Challenge"))
 
@@ -649,15 +763,13 @@ def _handle_pi_response(response: requests.Response, params: dict,
                 user = params.get("user", "")
                 realm_val = params.get("realm", "")
                 _log(L_INFO,
-                               f"privacyIDEA access denied for {user} realm='{realm_val}'")
+                     f"privacyIDEA access denied for {user} realm='{realm_val}'")
                 g_return = RLM_MODULE_REJECT
 
         elif not decoded.get("result", {}).get("status"):
             # Internal error
-            _log(L_INFO, "privacyIDEA Result status is false!")
             error_msg = decoded.get("result", {}).get("error", {}).get("message", "")
             reply_pairs[reply_message_idx] = ("Reply-Message", error_msg)
-            _log(L_INFO, error_msg)
 
             error_code = decoded.get("result", {}).get("error", {}).get("code", 0)
             if error_code == 904:
@@ -665,11 +777,11 @@ def _handle_pi_response(response: requests.Response, params: dict,
             else:
                 g_return = RLM_MODULE_FAIL
 
-            _log(L_INFO, "privacyIDEA failed to handle the request")
+            _log(L_ERR,
+                 f"privacyIDEA internal error code={error_code}: {error_msg}")
 
     except Exception as e:
-        _log(L_INFO, str(e))
-        _log(L_INFO, "Can not parse response from privacyIDEA.")
+        _log(L_ERR, f"Cannot parse response from privacyIDEA: {e}")
 
     return g_return
 
@@ -681,7 +793,7 @@ def authenticate(p: tuple) -> tuple:
     config_pairs: list[tuple[str, str]] = []
 
     # Log config origin
-    _log(L_INFO, f"Config File {CONFIG_FILE}")
+    _log(L_DBG, f"Config File {CONFIG_FILE}")
 
     # Get auth-type specific config
     auth_type = rad_request.get("Auth-Type", "")
@@ -694,21 +806,19 @@ def authenticate(p: tuple) -> tuple:
     # --- Service-Type handling ---
     service_type = _get_service_type(rad_request)
     st_name = SERVICE_TYPE_NAMES.get(service_type, str(service_type))
-    _log(L_INFO, f"Service-Type: {st_name} ({service_type})")
-    _log(L_INFO, f"SERVICE_TYPE_MODE: {mode}")
+    _log(L_DBG, f"Service-Type: {st_name} ({service_type}) mode={mode}")
 
     # Service-Type=17 (Authorize Only) in strict mode:
     # skip authentication entirely, user is already authenticated
     if service_type == SERVICE_TYPE_AUTHORIZE_ONLY and mode == "strict":
         return _handle_authorize_only(rad_request, cfg)
 
-    _log(L_INFO, f"Debugging config: {cfg.get('DEBUG', 'FALSE')}")
-    _log(L_INFO, f"Verifying SSL certificate: {cfg.get('SSL_CHECK', 'FALSE')}")
-    _log(L_INFO, f"Default URL {url}")
+    _log(L_DBG, f"cfg DEBUG={cfg.get('DEBUG', 'FALSE')} "
+                f"SSL_CHECK={cfg.get('SSL_CHECK', 'FALSE')} URL={url}")
 
     if debug:
         for k, v in rad_request.items():
-            _log(L_DBG, f"RAD_REQUEST: {k} = {v}")
+            _log(L_DBG, f"RAD_REQUEST: {k} = {_redact_value(k, v)}")
 
     # --- Build privacyIDEA request params ---
     params = _build_params(rad_request, cfg)
@@ -718,21 +828,26 @@ def authenticate(p: tuple) -> tuple:
         reply_pairs.append(("Message-Authenticator",
                             rad_request["Message-Authenticator"]))
 
-    # Logging
-    _log(L_INFO, f"Auth-Type: {auth_type}")
-    _log(L_INFO, f"url: {url}")
-    _log(L_INFO, f"user sent to privacyidea: {params.get('user', '')}")
-    _log(L_INFO, f"realm sent to privacyidea: {params.get('realm', '')}")
-    _log(L_INFO, f"resolver sent to privacyidea: {params.get('resConf', '')}")
-    _log(L_INFO, f"client sent to privacyidea: {params.get('client', '')}")
-    _log(L_INFO, f"state sent to privacyidea: {params.get('state', '')}")
+    # Operational summary of incoming request (one line at INFO)
+    user_val = params.get("user", "")
+    realm_val = params.get("realm", "")
+    client_val = params.get("client", "")
+    state_val = params.get("state", "")
+    if state_val:
+        _log(L_INFO,
+             f"privacyIDEA challenge response received for {user_val} "
+             f"realm='{realm_val}' tx={state_val}")
+    else:
+        _log(L_INFO,
+             f"privacyIDEA auth request user={user_val} realm='{realm_val}' "
+             f"client={client_val} auth-type={auth_type or '-'}")
 
     if debug:
         for k, v in params.items():
-            _log(L_DBG, f"urlparam {k} = {v}")
+            _log(L_DBG, f"urlparam {k} = {_redact_value(k, v)}")
     else:
         for k in params:
-            _log(L_INFO, f"urlparam {k}")
+            _log(L_DBG, f"urlparam {k}")
 
     # --- Default: reject ---
     reply_pairs.append(("Reply-Message", "privacyIDEA server denied access!"))
@@ -742,7 +857,7 @@ def authenticate(p: tuple) -> tuple:
     try:
         response = _call_privacyidea(url, params, cfg)
     except Exception as e:
-        _log(L_INFO, f"privacyIDEA request failed: {e}")
+        _log(L_ERR, f"privacyIDEA request failed: {e}")
         reply_pairs[reply_message_idx] = (
             "Reply-Message", f"privacyIDEA request failed: {e}")
         g_return = RLM_MODULE_FAIL
@@ -754,6 +869,9 @@ def authenticate(p: tuple) -> tuple:
         response, params, cfg, service_type,
         reply_pairs, config_pairs, reply_message_idx, debug)
 
+    _log(L_DBG, f"RADIUS reply <<< code={RET_NAMES.get(g_return, g_return)} "
+                f"reply={_redact_mapping(reply_pairs)} "
+                f"config={_redact_mapping(config_pairs)}")
     _log(L_INFO, f"return {RET_NAMES.get(g_return, g_return)}")
     return (g_return, tuple(reply_pairs), tuple(config_pairs))
 
@@ -766,7 +884,30 @@ def preacct(p: tuple) -> tuple:
     return (RLM_MODULE_OK, (), ())
 
 
+_ACCT_STATUS_NAMES = {
+    "1": "Start", "2": "Stop", "3": "Interim-Update",
+    "7": "Accounting-On", "8": "Accounting-Off",
+}
+
+
 def accounting(p: tuple) -> tuple:
+    """Accounting handler — logs session events at L_INFO."""
+    rad_request = _request_to_dict(p)
+    for k, v in rad_request.items():
+        _log(L_DBG, f"ACCT_REQUEST: {k} = {_redact_value(k, v)}")
+    status = str(rad_request.get("Acct-Status-Type", ""))
+    status_name = _ACCT_STATUS_NAMES.get(status, status or "?")
+    user = rad_request.get("Stripped-User-Name",
+                           rad_request.get("User-Name", ""))
+    session_id = rad_request.get("Acct-Session-Id", "")
+    nas = rad_request.get("NAS-IP-Address",
+                          rad_request.get("NAS-Identifier", ""))
+    framed_ip = rad_request.get("Framed-IP-Address", "")
+    calling = rad_request.get("Calling-Station-Id", "")
+
+    _log(L_INFO,
+         f"Accounting {status_name} user={user} session={session_id} "
+         f"nas={nas} framed-ip={framed_ip} calling={calling}")
     return (RLM_MODULE_OK, (), ())
 
 

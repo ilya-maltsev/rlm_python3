@@ -233,9 +233,16 @@ All settings come from `.env` and can be overridden per-environment.
 | `RADIUS_PI_RESCONF` | (empty) | Resolver configuration |
 | `RADIUS_PI_SSLCHECK` | `false` | Verify SSL certificate (`true`/`false`) |
 | `RADIUS_PI_TIMEOUT` | `10` | HTTP request timeout in seconds |
-| `RADIUS_DEBUG` | `false` | Enable debug logging (`true`/`false`) |
+| `RADIUS_DEBUG` | `false` | Enable DEBUG-level packet dumps (`true`/`false`). See [Logging and syslog](#logging-and-syslog). |
 | `RADIUS_PORT` | `1812` | Host port for RADIUS auth (TCP + UDP) |
 | `RADIUS_PORT_INC` | `1813` | Host port for RADIUS accounting (UDP) |
+| `RADIUS_SYSLOG` | `true` | Enable syslog output from the Python plugin (in addition to `radiusd.radlog`) |
+| `RADIUS_SYSLOG_HOST` | (empty) | Remote rsyslog host. Empty uses local `busybox syslogd` inside the container. |
+| `RADIUS_SYSLOG_PORT` | `514` | Remote rsyslog port |
+| `RADIUS_SYSLOG_PROTO` | `udp` | Transport: `udp` or `tcp` |
+| `RADIUS_SYSLOG_FACILITY` | `auth` | Syslog facility: `auth`, `authpriv`, `daemon`, `local0`..`local7` |
+| `RADIUS_SYSLOG_TAG` | `privacyidea-radius` | Syslog program name / ident |
+| `RADIUS_SYSLOG_LEVEL` | `INFO` | Minimum level forwarded: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`. Must be `DEBUG` to see full-packet dumps from `RADIUS_DEBUG=true`. |
 
 These are injected into `rlm_python.ini` by `entrypoint.sh` at container
 startup.
@@ -293,12 +300,18 @@ At container startup (before FreeRADIUS launches), `entrypoint.sh`:
 1. Injects environment variables into `rlm_python.ini` via `sed`:
 
 ```
-RADIUS_PI_HOST      -> URL = <value>/validate/check
-RADIUS_PI_REALM     -> REALM = <value>
-RADIUS_PI_RESCONF   -> RESCONF = <value>
-RADIUS_PI_SSLCHECK  -> SSL_CHECK = <value>
-RADIUS_PI_TIMEOUT   -> TIMEOUT = <value>
-RADIUS_DEBUG        -> DEBUG = <value>
+RADIUS_PI_HOST         -> URL = <value>/validate/check
+RADIUS_PI_REALM        -> REALM = <value>
+RADIUS_PI_RESCONF      -> RESCONF = <value>
+RADIUS_PI_SSLCHECK     -> SSL_CHECK = <value>
+RADIUS_PI_TIMEOUT      -> TIMEOUT = <value>
+RADIUS_DEBUG           -> DEBUG = <value>
+RADIUS_SYSLOG_HOST     -> SYSLOG_HOST = <value>
+RADIUS_SYSLOG_PORT     -> SYSLOG_PORT = <value>
+RADIUS_SYSLOG_PROTO    -> SYSLOG_PROTO = <value>
+RADIUS_SYSLOG_FACILITY -> SYSLOG_FACILITY = <value>
+RADIUS_SYSLOG_TAG      -> SYSLOG_TAG = <value>
+RADIUS_SYSLOG_LEVEL    -> SYSLOG_LEVEL = <value>
 ```
 
 2. Starts `busybox syslogd` in background (output to stdout for
@@ -421,6 +434,14 @@ ADD_EMPTY_PASS = false
 | `SPLIT_NULL_BYTE` | `FALSE` | Split password on null byte and use only the first part (for certain PAP/EAP-GTC clients) |
 | `ADD_EMPTY_PASS` | `FALSE` | Send an empty password if none is provided (for trigger-challenge flows) |
 | `SERVICE_TYPE_MODE` | `permissive` | Service-Type handling mode (`strict` or `permissive`). See [Service-Type handling](#service-type-handling-rfc-2865) |
+| `SYSLOG` | `TRUE` | Enable Python syslog logger (in addition to `radiusd.radlog`) |
+| `SYSLOG_TAG` | `privacyidea-radius` | Syslog program name / ident |
+| `SYSLOG_FACILITY` | `auth` | Syslog facility (`auth`, `authpriv`, `daemon`, `local0`..`local7`) |
+| `SYSLOG_SOCKET` | (empty) | Override local syslog socket (else auto-detect `/dev/log` / `/var/run/syslog`) |
+| `SYSLOG_HOST` | (empty) | Remote rsyslog host. Empty = local socket. |
+| `SYSLOG_PORT` | `514` | Remote rsyslog port |
+| `SYSLOG_PROTO` | `udp` | Remote transport: `udp` or `tcp` |
+| `SYSLOG_LEVEL` | `INFO` | Minimum level forwarded: `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` |
 
 #### Auth-type overrides
 
@@ -717,6 +738,89 @@ the same response, use `permissive` mode.
 | 2 | `RLM_MODULE_OK` | Authentication successful |
 | 3 | `RLM_MODULE_HANDLED` | Challenge-response issued |
 | 6 | `RLM_MODULE_NOTFOUND` | User not found (PI error 904) |
+
+## Logging and syslog
+
+The plugin emits every log line through `_log(level, msg)` which writes to
+**both**:
+
+1. **FreeRADIUS** via `radiusd.radlog(level, msg)` — visible in `docker logs`
+   and the FreeRADIUS log file.
+2. **Python syslog** via `logging.handlers.SysLogHandler` — forwarded to a
+   local syslogd or a remote rsyslog server, depending on `SYSLOG_HOST`.
+
+### Two log tiers
+
+| Level | Contents |
+|-------|----------|
+| `INFO` (default) | One line per operational event: auth request summary (user/realm/client), challenge issued with transaction id, challenge response received, access granted with token serial, access denied, PI internal error, accounting Start/Stop/Interim. Safe for production. |
+| `DEBUG` | Everything at INFO, plus full-packet dumps (see below). Verbose. |
+
+Set `SYSLOG_LEVEL=DEBUG` (or `RADIUS_SYSLOG_LEVEL=DEBUG` via env) to forward
+debug traffic to your rsyslog server. `RADIUS_DEBUG=true` / INI `DEBUG=TRUE`
+must also be set to emit the DEBUG lines at all — the level filter comes after
+the emit decision.
+
+### Full-packet DEBUG dumps
+
+With `DEBUG=TRUE` in the INI (or `RADIUS_DEBUG=true` in the container env),
+the plugin logs:
+
+| Log prefix | Source | When |
+|------------|--------|------|
+| `RAD_REQUEST: <attr> = <value>` | Incoming Access-Request | `authenticate()` start |
+| `urlparam <key> = <value>` | privacyIDEA POST body fields | Before HTTP call |
+| `PI HTTP >>> POST <url> headers=… body=…` | Outbound HTTP request | Before `session.post()` |
+| `PI HTTP <<< <status> <reason> headers=… body=…` | Inbound HTTP response | After `session.post()` |
+| `Content <json>` | Full PI JSON response body | In `_handle_pi_response()` |
+| `RADIUS reply <<< code=… reply=… config=…` | Outbound RADIUS response | End of `authenticate()` / `_handle_authorize_only()` |
+| `ACCT_REQUEST: <attr> = <value>` | Incoming Accounting-Request | `accounting()` start |
+
+### Secret redaction (always on)
+
+Packet dumps are **redacted by default** — there is no opt-in toggle. Before
+any field is emitted, its key name is lowercased and compared against a list
+of known-secret substrings. Matching values are replaced with `***`:
+
+```
+password, pass,
+chap-challenge, chap-response, chap-password,
+mschap, ms-chap,
+authorization, cookie, token, secret
+```
+
+What this covers:
+
+- RADIUS `User-Password`, `CHAP-Password`, `CHAP-Challenge`, `MS-CHAP-*`
+  attributes in `RAD_REQUEST` / `ACCT_REQUEST` dumps
+- The `pass` field in the privacyIDEA POST body (`urlparam`, `PI HTTP >>>`)
+- `Authorization` / `Set-Cookie` response headers
+- `token` / `password` / `secret` fields anywhere in the JSON response body
+  (walked recursively; arrays and nested objects handled)
+- Values in the outgoing RADIUS reply whose attribute names match the list
+
+JSON bodies that fail to parse are logged verbatim (not JSON, nothing to
+redact). The redaction list is deliberately conservative — review the actual
+DEBUG output in a test environment before forwarding to a central aggregator
+in production.
+
+### Quick test with a local UDP listener
+
+```bash
+# on the host
+nc -u -l 1514
+```
+
+```ini
+# in rlm_python.ini (or via env vars)
+DEBUG = TRUE
+SYSLOG_HOST = host.docker.internal
+SYSLOG_PORT = 1514
+SYSLOG_LEVEL = DEBUG
+```
+
+Fire a test auth (`radtest user pass 127.0.0.1 0 testing123`) — the listener
+prints every attribute with secrets as `***`.
 
 ## Differences from the Perl plugin
 
