@@ -547,7 +547,7 @@ def _call_privacyidea(url: str, params: dict, cfg: dict) -> requests.Response:
 
 def instantiate(p: tuple) -> int:
     """Called once when FreeRADIUS loads the module."""
-    conf = dict(p)
+    conf = dict(p) if p else {}
     config_file = conf.get("configfile", "")
 
     # Load INI config first (populates global CONFIG)
