@@ -1,3 +1,5 @@
+🌐 **English** | [Русский](README.ru.md)
+
 # privacyIDEA FreeRADIUS Python Plugin (rlm_python3)
 
 A Python-based FreeRADIUS plugin for two-factor authentication against
