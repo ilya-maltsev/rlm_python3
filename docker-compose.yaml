@@ -10,6 +10,9 @@ services:
       RADIUS_PI_RESCONF: ${RADIUS_PI_RESCONF:-}
       RADIUS_PI_TIMEOUT: ${RADIUS_PI_TIMEOUT:-10}
       RADIUS_DEBUG: ${RADIUS_DEBUG:-false}
+      # [Mapping user] injection: comma-separated pi_key=Radius-Attribute pairs.
+      # Example: "vpn_ip=Framed-IP-Address,group=Class"
+      RADIUS_PI_MAPPING_USER: ${RADIUS_PI_MAPPING_USER:-}
     ports:
       - "${RADIUS_PORT:-1812}:1812/tcp"
       - "${RADIUS_PORT:-1812}:1812/udp"
