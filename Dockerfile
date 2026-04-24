@@ -13,7 +13,8 @@ COPY dictionary.netknights /etc/raddb/dictionary
 RUN apk update && apk add --no-cache \
         python3 \
         py3-requests \
-        py3-chardet
+        py3-chardet \
+        freeradius-utils
 
 
 RUN rm -f /etc/raddb/sites-enabled/inner-tunnel \
